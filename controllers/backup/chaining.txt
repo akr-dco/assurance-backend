@@ -1,0 +1,293 @@
+
+// CHAINING
+func GetChainingByDeviceNew(c *gin.Context) {
+	deviceID := c.Param("deviceID")
+	userID := c.GetString("username")
+	companyID := c.GetString("company_id")
+
+	if userID == "" {
+		utils.JSONError(c, http.StatusBadRequest, "user parameter is required")
+		return
+	}
+
+	// ============================
+	// GET DEVICE TIMEZONE
+	// ============================
+	tz := c.GetHeader("X-Timezone")
+	if tz == "" {
+		tz = "UTC"
+	}
+
+	userLoc, err := time.LoadLocation(tz)
+	if err != nil {
+		log.Println("[WARN] Invalid timezone, fallback UTC")
+		userLoc = time.UTC
+	}
+
+	query := `
+	SELECT 
+		mc.id, 
+		mc.name_chaining, 
+		mc.trigger_datetime, 
+		mc.frequency_value, 
+		mc.frequency_unit,
+		mc.event_trigger_id,
+		et.event_name,               
+		et.trigger AS event_trigger_active,
+		mc.is_active
+	FROM mstr_device md
+	JOIN mstr_group_device mgd ON mgd.mstr_device_id = md.id 
+	JOIN mstr_group mg ON mg.id = mgd.mstr_group_id AND mg.deleted_at IS NULL
+	JOIN mstr_group_chaining mgc ON mgc.mstr_group_id = mg.id 
+	JOIN mstr_chainings mc ON mc.id = mgc.mstr_chaining_id AND mc.deleted_at IS NULL
+	LEFT JOIN mstr_event_triggers et ON et.id = mc.event_trigger_id AND et.deleted_at IS NULL
+	WHERE mc.is_active = true 
+	AND md.device_id = ? AND md.company_id = ? AND mc.company_id = ?
+	AND md.deleted_at IS NULL
+	`
+
+	type Chaining struct {
+		Id                 uint
+		NameChaining       string
+		TriggerDatetime    time.Time
+		FrequencyValue     uint
+		FrequencyUnit      string
+		EventTriggerID     *uint
+		EventName          string
+		EventTriggerActive bool
+		IsActive           bool
+	}
+
+	var chainings []Chaining
+	if err := config.DB.Raw(query, deviceID, companyID, companyID).Scan(&chainings).Error; err != nil {
+		utils.JSONError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	nowLocal := time.Now().UTC().In(userLoc)
+	var activeChains []gin.H
+
+	for _, chain := range chainings {
+
+		triggerLocal := chain.TriggerDatetime.UTC().In(userLoc)
+		if triggerLocal.IsZero() || triggerLocal.After(nowLocal) {
+			continue
+		}
+
+		// =====================
+		// WINDOW START
+		// =====================
+		windowStart := getCurrentTriggerWindowDevice(
+			triggerLocal,
+			int(chain.FrequencyValue),
+			chain.FrequencyUnit,
+			nowLocal,
+		)
+
+		// =====================
+		// WINDOW END
+		// =====================
+		var windowEnd time.Time
+		if isMonthly(chain.FrequencyUnit) {
+			windowEnd = nextMonthlyWithAnchor(
+				windowStart,
+				int(chain.FrequencyValue),
+				triggerLocal.Day(),
+			)
+		} else {
+			windowEnd = windowStart.Add(
+				calcDuration(chain.FrequencyValue, chain.FrequencyUnit),
+			)
+		}
+
+		// =====================
+		// DETAIL ITEM
+		// =====================
+		var details []struct {
+			ID       int
+			ItemType string
+			ItemID   int
+			Sequence int
+		}
+
+		config.DB.Table("mstr_chaining_details").
+			Select("id, item_type, item_id, sequence").
+			Where("id_chaining = ? AND deleted_at IS NULL", chain.Id).
+			Order("sequence ASC").
+			Scan(&details)
+
+		if len(details) == 0 {
+			continue
+		}
+
+		var activeItems []gin.H
+		allDone := true
+
+		for _, d := range details {
+			var doneAt time.Time
+			var itemName string
+
+			switch d.ItemType {
+			case "inspection":
+				config.DB.Raw(`SELECT name_inspection FROM mstr_inspection WHERE id = ?`, d.ItemID).
+					Scan(&itemName)
+
+				config.DB.Raw(`
+					SELECT created_at FROM trx_inspection
+					WHERE id_inspection = ? AND chaining_id = ? AND created_by = ?
+					AND created_at >= ? AND created_at < ?
+					ORDER BY created_at DESC LIMIT 1`,
+					d.ItemID, chain.Id, userID,
+					windowStart.UTC(), windowEnd.UTC(),
+				).Scan(&doneAt)
+
+			case "questionnaire":
+				config.DB.Raw(`SELECT title FROM questionnaires WHERE id = ?`, d.ItemID).
+					Scan(&itemName)
+
+				config.DB.Raw(`
+					SELECT created_at FROM mstr_answer
+					WHERE questionnaire_id = ? AND chaining_id = ? AND created_by = ?
+					AND created_at >= ? AND created_at < ?
+					ORDER BY created_at DESC LIMIT 1`,
+					d.ItemID, chain.Id, userID,
+					windowStart.UTC(), windowEnd.UTC(),
+				).Scan(&doneAt)
+			}
+
+			if doneAt.IsZero() {
+				allDone = false
+				activeItems = append(activeItems, gin.H{
+					"id_detail": d.ID,
+					"item_type": d.ItemType,
+					"item_id":   d.ItemID,
+					"item_name": itemName,
+					"sequence":  d.Sequence,
+				})
+			}
+		}
+
+		if !allDone {
+			if (chain.EventName == "" || chain.EventName == "<nil>") && len(activeItems) > 0 {
+				chain.EventTriggerActive = true
+			}
+
+			activeChains = append(activeChains, gin.H{
+				"id":              chain.Id,
+				"name_chaining":   chain.NameChaining,
+				"frequency_unit":  chain.FrequencyUnit,
+				"frequency_value": chain.FrequencyValue,
+
+				"trigger_time_utc":     windowStart.UTC(),
+				"trigger_time_utc_end": windowEnd.UTC(),
+
+				"trigger_time_local":     windowStart,
+				"trigger_time_local_end": windowEnd,
+
+				"event_trigger_id":     chain.EventTriggerID,
+				"event_name":           chain.EventName,
+				"event_trigger_active": chain.EventTriggerActive,
+
+				"active_items": activeItems,
+				"timezone":     userLoc.String(),
+			})
+		}
+	}
+
+	utils.JSONSuccess(c, "Active chaining fetched", activeChains)
+}
+
+func getCurrentTriggerWindowDevice(trigger time.Time, freq int, unit string, now time.Time) time.Time {
+	if freq <= 0 || unit == "" || now.Before(trigger) {
+		return trigger
+	}
+
+	switch strings.ToLower(unit) {
+
+	case "hour", "hours", "hourly":
+		diff := now.Sub(trigger)
+		cycle := time.Duration(freq) * time.Hour
+		return trigger.Add(time.Duration(int(diff/cycle)) * cycle)
+
+	case "day", "daily":
+		diff := now.Sub(trigger)
+		cycle := time.Duration(freq) * 24 * time.Hour
+		return trigger.Add(time.Duration(int(diff/cycle)) * cycle)
+
+	case "week", "weekly":
+		diff := now.Sub(trigger)
+		cycle := time.Duration(freq) * 7 * 24 * time.Hour
+		return trigger.Add(time.Duration(int(diff/cycle)) * cycle)
+
+	case "month", "monthly":
+		return calculateMonthlyWindowAnchored(trigger, freq, now)
+	}
+
+	return trigger
+}
+
+func calculateMonthlyWindowAnchored(trigger time.Time, freq int, now time.Time) time.Time {
+	anchorDay := trigger.Day()
+	current := trigger
+
+	for {
+		next := nextMonthlyWithAnchor(current, freq, anchorDay)
+		if next.After(now) {
+			return current
+		}
+		current = next
+	}
+}
+
+func nextMonthlyWithAnchor(base time.Time, months int, anchorDay int) time.Time {
+	year, month, _ := base.Date()
+	loc := base.Location()
+
+	targetMonth := int(month) + months
+	targetYear := year + (targetMonth-1)/12
+	targetMonth = (targetMonth-1)%12 + 1
+
+	lastDay := time.Date(
+		targetYear,
+		time.Month(targetMonth+1),
+		0,
+		base.Hour(),
+		base.Minute(),
+		base.Second(),
+		base.Nanosecond(),
+		loc,
+	).Day()
+
+	day := anchorDay
+	if day > lastDay {
+		day = lastDay
+	}
+
+	return time.Date(
+		targetYear,
+		time.Month(targetMonth),
+		day,
+		base.Hour(),
+		base.Minute(),
+		base.Second(),
+		base.Nanosecond(),
+		loc,
+	)
+}
+
+func calcDuration(freq uint, unit string) time.Duration {
+	switch strings.ToLower(unit) {
+	case "hour", "hours", "hourly":
+		return time.Duration(freq) * time.Hour
+	case "day", "daily":
+		return time.Duration(freq) * 24 * time.Hour
+	case "week", "weekly":
+		return time.Duration(freq) * 7 * 24 * time.Hour
+	}
+	return time.Hour
+}
+
+func isMonthly(unit string) bool {
+	u := strings.ToLower(unit)
+	return u == "month" || u == "monthly"
+}
