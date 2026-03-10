@@ -14,12 +14,12 @@ pipeline {
                 script {
                     if (env.BRANCH_NAME == 'main') {
                         env.TARGET_HOST = env.PROD_HOST
-                        env.TARGET_DIR  = "/home/cicd/assurance-frontend"
+                        env.TARGET_DIR  = "/home/cicd/assurance-backend"
                         env.DEPLOY_ENV  = "PRODUCTION"
                     } 
                     else if (env.BRANCH_NAME == 'staging') {
                         env.TARGET_HOST = env.STAGING_HOST
-                        env.TARGET_DIR  = "/home/cicd/assurance-frontend"
+                        env.TARGET_DIR  = "/home/cicd/assurance-backend"
                         env.DEPLOY_ENV  = "STAGING"
                     } 
                     else {
