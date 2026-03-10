@@ -7,5 +7,6 @@ services:
     volumes:
       - ./.env.development:/app/.env.development
       - ./.env.production:/app/.env.production
+      - ./uploads:/app/uploads
     environment:
       - APP_ENV=production
